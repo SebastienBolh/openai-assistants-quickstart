@@ -66,17 +66,12 @@ const Chat = () => {
   // create a new threadID when chat component created
   useEffect(() => {
     const createThread = async () => {
-      const res = await fetch(
-        "https://your-lambda-endpoint.amazonaws.com/dev",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-        }
-      );
+      const res = await fetch(`/api/assistants/threads`, {
+        method: "POST",
+      });
       const data = await res.json();
       setThreadId(data.threadId);
     };
-
     createThread();
   }, []);
 
@@ -84,9 +79,9 @@ const Chat = () => {
     setInputDisabled(true);
     setIsThinking(true);
 
-    // add the user message to the thread
+    // Add the user message to the thread
     const addMessageResponse = await fetch(
-      `LAMBDA_FUNCTION_URL/threads/${threadId}/messages`,
+      `/api/assistants/threads/${threadId}/messages`,
       {
         method: "POST",
         headers: {
@@ -132,8 +127,9 @@ const Chat = () => {
       { role: "assistant", text: "...", id: "thinking" },
     ]);
 
+    // Create a run on the thread
     const runResponse = await fetch(
-      `${LAMBDA_FUNCTION_URL}/threads/${threadId}/runs`,
+      `/api/assistants/threads/${threadId}/runs`,
       {
         method: "POST",
         headers: {
@@ -201,15 +197,12 @@ const Chat = () => {
 
     // When the run is completed, fetch the assistant messages
     if (runStatus === "completed") {
-      const getMessagesResponse = await fetch(
-        `LAMBDA_FUNCTION_URL/threads/${threadId}/messages`,
-        {
-          method: "GET",
-        }
+      const messagesResponse = await fetch(
+        `/api/assistants/threads/${threadId}/messages`
       );
 
-      if (!getMessagesResponse.ok) {
-        const errorData = await getMessagesResponse.text();
+      if (!messagesResponse.ok) {
+        const errorData = await messagesResponse.text();
         console.error("Failed to fetch messages:", errorData);
         setInputDisabled(false);
         setIsThinking(false);
@@ -219,7 +212,7 @@ const Chat = () => {
         return;
       }
 
-      const messagesData = await getMessagesResponse.json();
+      const messagesData = await messagesResponse.json();
 
       // Update messages state with assistant messages
       // Filter out messages already in state
