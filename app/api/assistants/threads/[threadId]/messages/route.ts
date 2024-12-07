@@ -1,20 +1,39 @@
-import { assistantId } from "@/app/assistant-config";
+import { NextResponse } from "next/server";
 import { openai } from "@/app/openai";
 
 export const runtime = "nodejs";
 
 // Send a new message to a thread
 export async function POST(request, { params: { threadId } }) {
-  const { content } = await request.json();
+  try {
+    const { role, content } = await request.json();
 
-  await openai.beta.threads.messages.create(threadId, {
-    role: "user",
-    content: content,
-  });
+    const message = await openai.beta.threads.messages.create(threadId, {
+      role: role || "user",
+      content: content,
+    });
 
-  const stream = openai.beta.threads.runs.stream(threadId, {
-    assistant_id: assistantId,
-  });
+    console.log("Added message:", message);
 
-  return new Response(stream.toReadableStream());
+    return NextResponse.json({ messageId: message.id });
+  } catch (error: any) {
+    console.error("Error adding message:", error);
+    const errorMessage = error?.message || "An unknown error occurred.";
+    return NextResponse.json({ error: errorMessage }, { status: 500 });
+  }
+}
+
+export async function GET(request, { params: { threadId } }) {
+  try {
+    const threadMessages = await openai.beta.threads.messages.list(threadId);
+
+    console.log(threadMessages.data);
+
+    return NextResponse.json(threadMessages.data);
+  } catch (error: any) {
+    return NextResponse.json(
+      { error: "An unknown error occurred." },
+      { status: 500 }
+    );
+  }
 }

@@ -2,11 +2,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import styles from "./chat.module.css";
-import { AssistantStream } from "openai/lib/AssistantStream";
 import Markdown from "react-markdown";
-// @ts-expect-error - no types for this yet
-import { AssistantStreamEvent } from "openai/resources/beta/assistants/assistants";
-import { RequiredActionFunctionToolCall } from "openai/resources/beta/threads/runs/runs";
 
 type MessageProps = {
   role: "user" | "assistant" | "code";
@@ -51,19 +47,12 @@ const Message = ({ role, text }: MessageProps) => {
   }
 };
 
-type ChatProps = {
-  functionCallHandler?: (
-    toolCall: RequiredActionFunctionToolCall
-  ) => Promise<string>;
-};
-
-const Chat = ({
-  functionCallHandler = () => Promise.resolve(""), // default to return empty string
-}: ChatProps) => {
+const Chat = () => {
   const [userInput, setUserInput] = useState("");
   const [messages, setMessages] = useState([]);
   const [inputDisabled, setInputDisabled] = useState(false);
   const [threadId, setThreadId] = useState("");
+  const [isThinking, setIsThinking] = useState(false);
 
   // automatically scroll to bottom of chat
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -77,176 +66,208 @@ const Chat = ({
   // create a new threadID when chat component created
   useEffect(() => {
     const createThread = async () => {
-      const res = await fetch(`/api/assistants/threads`, {
-        method: "POST",
-      });
+      const res = await fetch(
+        "https://your-lambda-endpoint.amazonaws.com/dev",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }
+      );
       const data = await res.json();
       setThreadId(data.threadId);
     };
+
     createThread();
   }, []);
 
-  const sendMessage = async (text) => {
-    const response = await fetch(
-      `/api/assistants/threads/${threadId}/messages`,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          content: text,
-        }),
-      }
-    );
-    const stream = AssistantStream.fromReadableStream(response.body);
-    handleReadableStream(stream);
-  };
+  const sendMessage = async (text, tempId) => {
+    setInputDisabled(true);
+    setIsThinking(true);
 
-  const submitActionResult = async (runId, toolCallOutputs) => {
-    const response = await fetch(
-      `/api/assistants/threads/${threadId}/actions`,
+    // add the user message to the thread
+    const addMessageResponse = await fetch(
+      `LAMBDA_FUNCTION_URL/threads/${threadId}/messages`,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          runId: runId,
-          toolCallOutputs: toolCallOutputs,
+          role: "user",
+          content: text,
         }),
       }
     );
-    const stream = AssistantStream.fromReadableStream(response.body);
-    handleReadableStream(stream);
+
+    if (!addMessageResponse.ok) {
+      const errorData = await addMessageResponse.text();
+      console.error("Failed to add message:", errorData);
+      setInputDisabled(false);
+      setIsThinking(false);
+      return;
+    }
+
+    const messageData = await addMessageResponse.json();
+
+    // Replace the temporary ID with the server-generated ID
+    setMessages((prevMessages) =>
+      prevMessages.map((msg) =>
+        msg.id === tempId ? { ...msg, id: messageData.id } : msg
+      )
+    );
+
+    // Update messages state with user's message
+    setMessages((prevMessages) => {
+      const existingIds = new Set(prevMessages.map((msg) => msg.id));
+      const newMessage = { role: "user", text, id: messageData.id };
+
+      return existingIds.has(newMessage.id)
+        ? prevMessages
+        : [...prevMessages, newMessage];
+    });
+
+    // Add the "thinking" bubble
+    setMessages((prevMessages) => [
+      ...prevMessages,
+      { role: "assistant", text: "...", id: "thinking" },
+    ]);
+
+    const runResponse = await fetch(
+      `${LAMBDA_FUNCTION_URL}/threads/${threadId}/runs`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          instructions: "", // Add any instructions if needed
+        }),
+      }
+    );
+
+    console.log("RUN RESPONSE", runResponse);
+
+    if (!runResponse.ok) {
+      const errorData = await runResponse.text();
+      console.error("Run creation failed:", errorData);
+      setInputDisabled(false);
+      setIsThinking(false);
+      setMessages((prevMessages) =>
+        prevMessages.filter((msg) => msg.id !== "thinking")
+      );
+      return;
+    }
+
+    const runData = await runResponse.json();
+    const runId = runData.runId;
+
+    // Poll for the run's status
+    await pollRunStatus(runId);
+  };
+
+  const pollRunStatus = async (runId) => {
+    let runStatus = "running";
+    while (
+      ["running", "requires_action", "waiting", "in_progress"].includes(
+        runStatus
+      )
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 1000)); // Wait 1 second
+
+      const statusResponse = await fetch(
+        `/api/assistants/threads/${threadId}/runs/${runId}`
+      );
+
+      if (!statusResponse.ok) {
+        const errorData = await statusResponse.text();
+        console.error("Failed to fetch run status:", errorData);
+        setInputDisabled(false);
+        setIsThinking(false);
+        setMessages((prevMessages) =>
+          prevMessages.filter((msg) => msg.id !== "thinking")
+        );
+        return;
+      }
+
+      const statusData = await statusResponse.json();
+      runStatus = statusData.status;
+      console.log(`Run status: ${runStatus}`);
+
+      if (runStatus === "requires_action") {
+        // Handle required actions (e.g., function calls)
+        // ...
+      }
+    }
+
+    // When the run is completed, fetch the assistant messages
+    if (runStatus === "completed") {
+      const getMessagesResponse = await fetch(
+        `LAMBDA_FUNCTION_URL/threads/${threadId}/messages`,
+        {
+          method: "GET",
+        }
+      );
+
+      if (!getMessagesResponse.ok) {
+        const errorData = await getMessagesResponse.text();
+        console.error("Failed to fetch messages:", errorData);
+        setInputDisabled(false);
+        setIsThinking(false);
+        setMessages((prevMessages) =>
+          prevMessages.filter((msg) => msg.id !== "thinking")
+        );
+        return;
+      }
+
+      const messagesData = await getMessagesResponse.json();
+
+      // Update messages state with assistant messages
+      // Filter out messages already in state
+      const existingMessageIds = new Set(messages.map((msg) => msg.id));
+      const newMessages = messagesData.filter(
+        (msg) => !existingMessageIds.has(msg.id) && msg.role === "assistant"
+      );
+
+      if (newMessages.length > 0) {
+        const latestMessage = newMessages[newMessages.length - 1];
+
+        setMessages((prevMessages) =>
+          prevMessages.map((msg) =>
+            msg.id === "thinking"
+              ? {
+                  role: "assistant",
+                  text: latestMessage.content[0]?.text?.value || "",
+                  id: latestMessage.id,
+                }
+              : msg
+          )
+        );
+      }
+
+      setInputDisabled(false);
+      setIsThinking(false);
+    } else {
+      // Handle other statuses if necessary
+      setInputDisabled(false);
+      setIsThinking(false);
+    }
   };
 
   const handleSubmit = (e) => {
     e.preventDefault();
     if (!userInput.trim()) return;
-    sendMessage(userInput);
+
+    const tempId = `temp-${Date.now()}`; // Temporary ID
+
     setMessages((prevMessages) => [
       ...prevMessages,
-      { role: "user", text: userInput },
+      { role: "user", text: userInput, id: tempId },
     ]);
+
+    sendMessage(userInput, tempId);
     setUserInput("");
-    setInputDisabled(true);
     scrollToBottom();
   };
-
-  /* Stream Event Handlers */
-
-  // textCreated - create new assistant message
-  const handleTextCreated = () => {
-    appendMessage("assistant", "");
-  };
-
-  // textDelta - append text to last assistant message
-  const handleTextDelta = (delta) => {
-    if (delta.value != null) {
-      appendToLastMessage(delta.value);
-    };
-    if (delta.annotations != null) {
-      annotateLastMessage(delta.annotations);
-    }
-  };
-
-  // imageFileDone - show image in chat
-  const handleImageFileDone = (image) => {
-    appendToLastMessage(`\n![${image.file_id}](/api/files/${image.file_id})\n`);
-  }
-
-  // toolCallCreated - log new tool call
-  const toolCallCreated = (toolCall) => {
-    if (toolCall.type != "code_interpreter") return;
-    appendMessage("code", "");
-  };
-
-  // toolCallDelta - log delta and snapshot for the tool call
-  const toolCallDelta = (delta, snapshot) => {
-    if (delta.type != "code_interpreter") return;
-    if (!delta.code_interpreter.input) return;
-    appendToLastMessage(delta.code_interpreter.input);
-  };
-
-  // handleRequiresAction - handle function call
-  const handleRequiresAction = async (
-    event: AssistantStreamEvent.ThreadRunRequiresAction
-  ) => {
-    const runId = event.data.id;
-    const toolCalls = event.data.required_action.submit_tool_outputs.tool_calls;
-    // loop over tool calls and call function handler
-    const toolCallOutputs = await Promise.all(
-      toolCalls.map(async (toolCall) => {
-        const result = await functionCallHandler(toolCall);
-        return { output: result, tool_call_id: toolCall.id };
-      })
-    );
-    setInputDisabled(true);
-    submitActionResult(runId, toolCallOutputs);
-  };
-
-  // handleRunCompleted - re-enable the input form
-  const handleRunCompleted = () => {
-    setInputDisabled(false);
-  };
-
-  const handleReadableStream = (stream: AssistantStream) => {
-    // messages
-    stream.on("textCreated", handleTextCreated);
-    stream.on("textDelta", handleTextDelta);
-
-    // image
-    stream.on("imageFileDone", handleImageFileDone);
-
-    // code interpreter
-    stream.on("toolCallCreated", toolCallCreated);
-    stream.on("toolCallDelta", toolCallDelta);
-
-    // events without helpers yet (e.g. requires_action and run.done)
-    stream.on("event", (event) => {
-      if (event.event === "thread.run.requires_action")
-        handleRequiresAction(event);
-      if (event.event === "thread.run.completed") handleRunCompleted();
-    });
-  };
-
-  /*
-    =======================
-    === Utility Helpers ===
-    =======================
-  */
-
-  const appendToLastMessage = (text) => {
-    setMessages((prevMessages) => {
-      const lastMessage = prevMessages[prevMessages.length - 1];
-      const updatedLastMessage = {
-        ...lastMessage,
-        text: lastMessage.text + text,
-      };
-      return [...prevMessages.slice(0, -1), updatedLastMessage];
-    });
-  };
-
-  const appendMessage = (role, text) => {
-    setMessages((prevMessages) => [...prevMessages, { role, text }]);
-  };
-
-  const annotateLastMessage = (annotations) => {
-    setMessages((prevMessages) => {
-      const lastMessage = prevMessages[prevMessages.length - 1];
-      const updatedLastMessage = {
-        ...lastMessage,
-      };
-      annotations.forEach((annotation) => {
-        if (annotation.type === 'file_path') {
-          updatedLastMessage.text = updatedLastMessage.text.replaceAll(
-            annotation.text,
-            `/api/files/${annotation.file_path.file_id}`
-          );
-        }
-      })
-      return [...prevMessages.slice(0, -1), updatedLastMessage];
-    });
-    
-  }
 
   return (
     <div className={styles.chatContainer}>
